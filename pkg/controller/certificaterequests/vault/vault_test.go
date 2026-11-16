@@ -31,17 +31,17 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	coretesting "k8s.io/client-go/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	internalvault "github.com/cert-manager/cert-manager/internal/vault"
 	fakevault "github.com/cert-manager/cert-manager/internal/vault/fake"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/controller"
+	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificaterequests"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
@@ -64,9 +64,8 @@ func generateCSR(t *testing.T, secretKey crypto.Signer) []byte {
 	return csr
 }
 
-func generateSelfSignedCertFromCR(cr *cmapi.CertificateRequest, key crypto.Signer,
-	duration time.Duration) ([]byte, error) {
-	template, err := pki.GenerateTemplateFromCertificateRequest(cr)
+func generateSelfSignedCertFromCR(cr *cmapi.CertificateRequest, key crypto.Signer) ([]byte, error) {
+	template, err := pki.CertificateTemplateFromCertificateRequest(cr)
 	if err != nil {
 		return nil, fmt.Errorf("error generating template: %v", err)
 	}
@@ -88,7 +87,9 @@ func generateSelfSignedCertFromCR(cr *cmapi.CertificateRequest, key crypto.Signe
 func TestSign(t *testing.T) {
 	metaFixedClockStart := metav1.NewTime(fixedClockStart)
 	baseIssuer := gen.Issuer("vault-issuer",
-		gen.SetIssuerVault(cmapi.VaultIssuer{}),
+		gen.SetIssuerVault(cmapi.VaultIssuer{
+			Server: "https://example.vault.com",
+		}),
 		gen.AddIssuerCondition(cmapi.IssuerCondition{
 			Type:   cmapi.IssuerConditionReady,
 			Status: cmmeta.ConditionTrue,
@@ -107,7 +108,7 @@ func TestSign(t *testing.T) {
 		gen.SetCertificateRequestIsCA(true),
 		gen.SetCertificateRequestCSR(csrPEM),
 		gen.SetCertificateRequestDuration(&metav1.Duration{Duration: time.Hour * 24 * 60}),
-		gen.SetCertificateRequestIssuer(cmmeta.ObjectReference{
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
 			Name:  baseIssuer.Name,
 			Group: certmanager.GroupName,
 			Kind:  baseIssuer.Kind,
@@ -132,27 +133,23 @@ func TestSign(t *testing.T) {
 		}),
 	)
 
-	rsaPEMCert, err := generateSelfSignedCertFromCR(baseCR, rsaSK, time.Hour*24*60)
+	rsaPEMCert, err := generateSelfSignedCertFromCR(baseCR, rsaSK)
 	if err != nil {
 		t.Error(err)
 		t.FailNow()
 	}
 
 	tokenSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gen.DefaultTestNamespace,
-			Name:      "token-secret",
-		},
+		Namespace: gen.DefaultTestNamespace,
+		Name:      "token-secret",
 		Data: map[string][]byte{
 			"my-token-key": []byte("my-secret-token"),
 		},
 	}
 
 	roleSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gen.DefaultTestNamespace,
-			Name:      "role-secret",
-		},
+		Namespace: gen.DefaultTestNamespace,
+		Name:      "role-secret",
 		Data: map[string][]byte{
 			"my-role-key": []byte("my-secret-role"),
 		},
@@ -200,7 +197,7 @@ func TestSign(t *testing.T) {
 				KubeObjects:        []runtime.Object{},
 				CertManagerObjects: []runtime.Object{baseCR.DeepCopy(), baseIssuer.DeepCopy()},
 				ExpectedEvents: []string{
-					"Normal VaultInitError Failed to initialise vault client for signing: error initializing Vault client: tokenSecretRef, appRoleSecretRef, or Kubernetes auth role not set",
+					"Normal VaultInitError Failed to initialise vault client for signing: error initializing Vault client: unable to load credentials. One of: tokenSecretRef, appRoleSecretRef, clientCertificate, Kubernetes, or AWS auth must be set",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
@@ -212,7 +209,7 @@ func TestSign(t *testing.T) {
 								Type:               cmapi.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
 								Reason:             cmapi.CertificateRequestReasonPending,
-								Message:            "Failed to initialise vault client for signing: error initializing Vault client: tokenSecretRef, appRoleSecretRef, or Kubernetes auth role not set",
+								Message:            "Failed to initialise vault client for signing: error initializing Vault client: unable to load credentials. One of: tokenSecretRef, appRoleSecretRef, clientCertificate, Kubernetes, or AWS auth must be set",
 								LastTransitionTime: &metaFixedClockStart,
 							}),
 						),
@@ -228,12 +225,11 @@ func TestSign(t *testing.T) {
 					gen.IssuerFrom(baseIssuer, gen.SetIssuerVault(cmapi.VaultIssuer{
 						Auth: cmapi.VaultAuth{
 							TokenSecretRef: &cmmeta.SecretKeySelector{
-								Key: "secret-key",
-								LocalObjectReference: cmmeta.LocalObjectReference{
-									Name: "non-existing-secret",
-								},
+								Key:  "secret-key",
+								Name: "non-existing-secret",
 							},
 						},
+						Server: "https://example.vault.com",
 					})),
 				},
 				ExpectedEvents: []string{
@@ -274,6 +270,7 @@ func TestSign(t *testing.T) {
 								},
 							},
 						},
+						Server: "https://example.vault.com",
 					}),
 				)},
 				ExpectedEvents: []string{
@@ -326,6 +323,45 @@ func TestSign(t *testing.T) {
 				},
 			},
 		},
+		"a client with a token secret referenced with token but temporary failed to authenticate should report pending and return error": {
+			certificateRequest: baseCR.DeepCopy(),
+			builder: &testpkg.Builder{
+				KubeObjects: []runtime.Object{tokenSecret},
+				CertManagerObjects: []runtime.Object{baseCR.DeepCopy(), gen.IssuerFrom(baseIssuer,
+					gen.SetIssuerVault(cmapi.VaultIssuer{
+						Auth: cmapi.VaultAuth{
+							TokenSecretRef: &cmmeta.SecretKeySelector{
+								Key:  "my-token-key",
+								Name: "token-secret",
+							},
+						},
+					}),
+				)},
+				ExpectedEvents: []string{
+					"Normal VaultInitError Failed to initialise vault client for signing: failed to create vault client, temporary auth failure",
+				},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
+						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						"status",
+						gen.DefaultTestNamespace,
+						gen.CertificateRequestFrom(baseCR,
+							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+								Type:               cmapi.CertificateRequestConditionReady,
+								Status:             cmmeta.ConditionFalse,
+								Reason:             cmapi.CertificateRequestReasonPending,
+								Message:            "Failed to initialise vault client for signing: failed to create vault client, temporary auth failure",
+								LastTransitionTime: &metaFixedClockStart,
+							}),
+						),
+					)),
+				},
+			},
+			fakeVault: fakevault.New().WithNew(func(string, internalinformers.SecretLister, cmapi.GenericIssuer) (*fakevault.Vault, error) {
+				return nil, errors.New("failed to create vault client, temporary auth failure")
+			}),
+			expectedErr: true,
+		},
 		"a client with a token secret referenced with token but failed to sign should report fail": {
 			certificateRequest: baseCR.DeepCopy(),
 			builder: &testpkg.Builder{
@@ -334,10 +370,8 @@ func TestSign(t *testing.T) {
 					gen.SetIssuerVault(cmapi.VaultIssuer{
 						Auth: cmapi.VaultAuth{
 							TokenSecretRef: &cmmeta.SecretKeySelector{
-								Key: "my-token-key",
-								LocalObjectReference: cmmeta.LocalObjectReference{
-									Name: "token-secret",
-								},
+								Key:  "my-token-key",
+								Name: "token-secret",
 							},
 						},
 					}),
@@ -415,10 +449,8 @@ func TestSign(t *testing.T) {
 					gen.SetIssuerVault(cmapi.VaultIssuer{
 						Auth: cmapi.VaultAuth{
 							TokenSecretRef: &cmmeta.SecretKeySelector{
-								Key: "my-token-key",
-								LocalObjectReference: cmmeta.LocalObjectReference{
-									Name: "token-secret",
-								},
+								Key:  "my-token-key",
+								Name: "token-secret",
 							},
 						},
 					}),
@@ -518,15 +550,15 @@ func runTest(t *testing.T, test testT) {
 	vault := NewVault(test.builder.Context).(*Vault)
 
 	if test.fakeVault != nil {
-		vault.vaultClientBuilder = func(ns string, sl corelisters.SecretLister,
-			iss cmapi.GenericIssuer) (internalvault.Interface, error) {
+		vault.vaultClientBuilder = func(_ context.Context, ns string, _ func(ns string) internalvault.CreateToken, sl internalinformers.SecretLister,
+			iss cmapi.GenericIssuer, _ bool) (internalvault.Interface, error) {
 			return test.fakeVault.New(ns, sl, iss)
 		}
 	}
 
 	controller := certificaterequests.New(
 		apiutil.IssuerVault,
-		func(*controller.Context) certificaterequests.Issuer { return vault },
+		func(*controllerpkg.Context) certificaterequests.Issuer { return vault },
 	)
 
 	if _, _, err := controller.Register(test.builder.Context); err != nil {
@@ -535,7 +567,7 @@ func runTest(t *testing.T, test testT) {
 
 	test.builder.Start()
 
-	err := controller.Sync(context.Background(), test.certificateRequest)
+	err := controller.Sync(t.Context(), test.certificateRequest)
 	if err != nil && !test.expectedErr {
 		t.Errorf("expected to not get an error, but got: %v", err)
 	}

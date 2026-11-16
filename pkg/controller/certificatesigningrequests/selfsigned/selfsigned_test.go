@@ -17,11 +17,10 @@ limitations under the License.
 package selfsigned
 
 import (
-	"context"
 	"crypto"
+	"crypto/mldsa"
 	"crypto/x509"
 	"errors"
-	"math"
 	"testing"
 	"time"
 
@@ -32,9 +31,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	coretesting "k8s.io/client-go/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -43,6 +45,7 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificatesigningrequests/util"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	"github.com/cert-manager/cert-manager/test/unit/gen"
 	testlisters "github.com/cert-manager/cert-manager/test/unit/listers"
@@ -77,10 +80,8 @@ func mustCryptoBundle(t *testing.T) cryptoBundle {
 	}
 
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-secret",
-			Namespace: "default-unit-test-ns",
-		},
+		Name:      "test-secret",
+		Namespace: "default-unit-test-ns",
 		Data: map[string][]byte{
 			corev1.TLSPrivateKeyKey: keyPEM,
 		},
@@ -265,17 +266,15 @@ func TestProcessItem(t *testing.T) {
 				CertManagerObjects: []runtime.Object{baseIssuer.DeepCopy()},
 				KubeObjects: []runtime.Object{
 					&corev1.Secret{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "test-secret",
-							Namespace: "default-unit-test-ns",
-						},
+						Name:      "test-secret",
+						Namespace: "default-unit-test-ns",
 						Data: map[string][]byte{
 							"tls.key": []byte("garbage data"),
 						},
 					},
 				},
 				ExpectedEvents: []string{
-					`Warning ErrorParsingKey Failed to parse signing key from secret default-unit-test-ns/test-secret: error decoding private key PEM block`,
+					`Warning ErrorParsingKey Failed to parse signing key from secret default-unit-test-ns/test-secret: error decoding private key PEM block: no PEM data was found in given input`,
 				},
 
 				ExpectedActions: []testpkg.Action{
@@ -320,7 +319,7 @@ func TestProcessItem(t *testing.T) {
 				CertManagerObjects: []runtime.Object{baseIssuer.DeepCopy()},
 				KubeObjects:        []runtime.Object{csrBundle.secret},
 				ExpectedEvents: []string{
-					"Warning ErrorGenerating Error generating certificate template: failed to decode csr",
+					"Warning ErrorGenerating Error generating certificate template: error decoding certificate request PEM block: no PEM data was found in given input",
 				},
 
 				ExpectedActions: []testpkg.Action{
@@ -364,7 +363,7 @@ func TestProcessItem(t *testing.T) {
 								Type:               certificatesv1.CertificateFailed,
 								Status:             corev1.ConditionTrue,
 								Reason:             "ErrorGenerating",
-								Message:            "Error generating certificate template: failed to decode csr",
+								Message:            "Error generating certificate template: error decoding certificate request PEM block: no PEM data was found in given input",
 								LastTransitionTime: metaFixedClockStart,
 								LastUpdateTime:     metaFixedClockStart,
 							}),
@@ -451,7 +450,7 @@ func TestProcessItem(t *testing.T) {
 				}),
 				gen.SetCertificateSigningRequestRequest(csrBundle.csrPEM),
 			),
-			signingFn: func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, interface{}) ([]byte, *x509.Certificate, error) {
+			signingFn: func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, any) ([]byte, *x509.Certificate, error) {
 				return nil, nil, errors.New("this is a signing error")
 			},
 
@@ -522,7 +521,7 @@ func TestProcessItem(t *testing.T) {
 				}),
 				gen.SetCertificateSigningRequestRequest(csrBundle.csrPEM),
 			),
-			signingFn: func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, interface{}) ([]byte, *x509.Certificate, error) {
+			signingFn: func(*x509.Certificate, *x509.Certificate, crypto.PublicKey, any) ([]byte, *x509.Certificate, error) {
 				return []byte("signed-cert"), nil, nil
 			},
 
@@ -530,7 +529,7 @@ func TestProcessItem(t *testing.T) {
 				CertManagerObjects: []runtime.Object{baseIssuer.DeepCopy()},
 				KubeObjects:        []runtime.Object{csrBundle.secret},
 				ExpectedEvents: []string{
-					"Normal CertificateIssued Certificate self signed successfully",
+					"Normal CertificateIssued Certificate self-signed successfully",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewCreateAction(
@@ -616,10 +615,14 @@ func TestProcessItem(t *testing.T) {
 				apiutil.IssuerSelfSigned,
 				func(*controller.Context) certificatesigningrequests.Signer { return selfsigned },
 			)
-			controller.Register(test.builder.Context)
+			if _, _, err := controller.Register(test.builder.Context); err != nil {
+				t.Fatal(err)
+			}
 			test.builder.Start()
 
-			err := controller.ProcessItem(context.Background(), test.csr.Name)
+			err := controller.ProcessItem(t.Context(), types.NamespacedName{
+				Name: test.csr.Name,
+			})
 			if err != nil && !test.expectedErr {
 				t.Errorf("expected to not get an error, but got: %v", err)
 			}
@@ -638,6 +641,13 @@ func TestSign(t *testing.T) {
 		gen.SetIssuerSelfSigned(cmapi.SelfSignedIssuer{}),
 	)
 
+	// Lower bound for the NotBefore of any certificate signed during this
+	// test. Truncated because NotBefore is truncated to a whole second when
+	// the certificate is serialized to ASN.1 [1].
+	//
+	//  [1]: https://tools.ietf.org/html/rfc5280#section-4.1.2.5.1
+	signStart := time.Now().Truncate(time.Second)
+
 	tests := map[string]struct {
 		csr              *certificatesv1.CertificateSigningRequest
 		issuer           *cmapi.Issuer
@@ -654,28 +664,14 @@ func TestSign(t *testing.T) {
 			),
 			issuer: baseIssuer,
 			assertSignedCert: func(t *testing.T, got *x509.Certificate) {
-				// Although there is less than 1µs between the time.Now
-				// call made by the certificate template func (in the "pki"
-				// package) and the time.Now below, rounding or truncating
-				// will always end up with a flaky test. This is due to the
-				// rounding made to the notAfter value when serializing the
-				// certificate to ASN.1 [1].
-				//
-				//  [1]: https://tools.ietf.org/html/rfc5280#section-4.1.2.5.1
-				//
-				// So instead of using a truncation or rounding in order to
-				// check the time, we use a delta of 2 seconds. One entire
-				// second is totally overkill since, as detailed above, the
-				// delay is probably less than a microsecond. But that will
-				// do for now!
-				//
-				// Note that we do have a plan to fix this. We want to be
-				// injecting a time (instead of time.Now) to the template
-				// functions. This work is being tracked in this issue:
-				// https://github.com/cert-manager/cert-manager/issues/3738
-				expectNotAfter := time.Now().UTC().Add(30 * time.Minute)
-				deltaSec := math.Abs(expectNotAfter.Sub(got.NotAfter).Seconds())
-				assert.LessOrEqualf(t, deltaSec, 2., "expected a time delta lower than 2 second. Time expected='%s', got='%s'", expectNotAfter.String(), got.NotAfter.String())
+				// NotBefore and NotAfter are set from a single time.Now
+				// call by the certificate template func (in the "pki"
+				// package), so the validity period of the signed
+				// certificate is exactly the requested duration.
+				assert.Equal(t, 30*time.Minute, got.NotAfter.Sub(got.NotBefore))
+				// And the validity period starts at the time of signing, not
+				// at some fixed time.
+				assert.WithinRange(t, got.NotBefore, signStart, time.Now())
 			},
 		},
 		"when the CertificateSigningRequest has the expiration seconds field set, it should appear as notAfter on the signed certificate": {
@@ -689,28 +685,12 @@ func TestSign(t *testing.T) {
 			),
 			issuer: baseIssuer,
 			assertSignedCert: func(t *testing.T, got *x509.Certificate) {
-				// Although there is less than 1µs between the time.Now
-				// call made by the certificate template func (in the "pki"
-				// package) and the time.Now below, rounding or truncating
-				// will always end up with a flaky test. This is due to the
-				// rounding made to the notAfter value when serializing the
-				// certificate to ASN.1 [1].
-				//
-				//  [1]: https://tools.ietf.org/html/rfc5280#section-4.1.2.5.1
-				//
-				// So instead of using a truncation or rounding in order to
-				// check the time, we use a delta of 2 seconds. One entire
-				// second is totally overkill since, as detailed above, the
-				// delay is probably less than a microsecond. But that will
-				// do for now!
-				//
-				// Note that we do have a plan to fix this. We want to be
-				// injecting a time (instead of time.Now) to the template
-				// functions. This work is being tracked in this issue:
-				// https://github.com/cert-manager/cert-manager/issues/3738
-				expectNotAfter := time.Now().UTC().Add(444 * time.Second)
-				deltaSec := math.Abs(expectNotAfter.Sub(got.NotAfter).Seconds())
-				assert.LessOrEqualf(t, deltaSec, 2., "expected a time delta lower than 2 second. Time expected='%s', got='%s'", expectNotAfter.String(), got.NotAfter.String())
+				// See the duration test above for why this assertion is
+				// exact.
+				assert.Equal(t, 444*time.Second, got.NotAfter.Sub(got.NotBefore))
+				// And the validity period starts at the time of signing, not
+				// at some fixed time.
+				assert.WithinRange(t, got.NotBefore, signStart, time.Now())
 			},
 		},
 		"when the CertificateSigningRequest has the isCA field set, it should appear on the signed certificate": {
@@ -765,11 +745,11 @@ func TestSign(t *testing.T) {
 				signingFn: pki.SignCertificate,
 			}
 
-			gotErr := selfsigned.Sign(context.Background(), test.csr, test.issuer)
+			gotErr := selfsigned.Sign(t.Context(), test.csr, test.issuer)
 			require.NoError(t, gotErr)
 			builder.Sync()
 
-			csr, err := builder.Client.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), test.csr.Name, metav1.GetOptions{})
+			csr, err := builder.Client.CertificatesV1().CertificateSigningRequests().Get(t.Context(), test.csr.Name, metav1.GetOptions{})
 			require.NoError(t, err)
 
 			require.NotEmpty(t, csr.Status.Certificate)
@@ -777,6 +757,102 @@ func TestSign(t *testing.T) {
 			require.NoError(t, err)
 
 			test.assertSignedCert(t, gotCert)
+		})
+	}
+}
+
+func TestSign_MLDSA(t *testing.T) {
+	key, err := pki.GenerateMLDSAPrivateKey(mldsa.MLDSA65())
+	require.NoError(t, err)
+	csrPEM, err := gen.CSRWithSigner(key, gen.SetCSRCommonName("test"))
+	require.NoError(t, err)
+	keyPEM, err := pki.EncodePKCS8PrivateKey(key)
+	require.NoError(t, err)
+	secret := &corev1.Secret{
+		Name:      "test-secret",
+		Namespace: "default-unit-test-ns",
+		Data: map[string][]byte{
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+	issuer := gen.Issuer("issuer-1",
+		gen.SetIssuerSelfSigned(cmapi.SelfSignedIssuer{}),
+	)
+
+	tests := map[string]struct {
+		usages            []certificatesv1.KeyUsage
+		featureEnabled    bool
+		wantFailedReason  string
+		wantFailedMessage string
+	}{
+		"an ML-DSA CSR should be signed if the MLDSAPrivateKeys feature gate is enabled": {
+			usages:         []certificatesv1.KeyUsage{certificatesv1.UsageDigitalSignature},
+			featureEnabled: true,
+		},
+		"an ML-DSA CSR with key encipherment should fail": {
+			usages:            []certificatesv1.KeyUsage{certificatesv1.UsageDigitalSignature, certificatesv1.UsageKeyEncipherment},
+			featureEnabled:    true,
+			wantFailedReason:  "ErrorSigning",
+			wantFailedMessage: "Error signing certificate: key usages [key encipherment] are not allowed for ML-DSA keys",
+		},
+		"an ML-DSA CSR should fail if the MLDSAPrivateKeys feature gate is disabled": {
+			usages:            []certificatesv1.KeyUsage{certificatesv1.UsageDigitalSignature},
+			wantFailedReason:  "MLDSAPrivateKeysDisabled",
+			wantFailedMessage: "Refusing to sign a certificate involving an ML-DSA key: the MLDSAPrivateKeys feature gate is disabled",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultMutableFeatureGate, feature.MLDSAPrivateKeys, test.featureEnabled)
+
+			givenCSR := gen.CertificateSigningRequest("csr-1",
+				gen.AddCertificateSigningRequestAnnotations(map[string]string{
+					"experimental.cert-manager.io/private-key-secret-name": "test-secret",
+				}),
+				gen.SetCertificateSigningRequestSignerName("issuers.cert-manager.io/default-unit-test-ns.issuer-1"),
+				gen.SetCertificateSigningRequestUsages(test.usages),
+				gen.SetCertificateSigningRequestRequest(csrPEM),
+			)
+
+			builder := &testpkg.Builder{
+				KubeObjects:        []runtime.Object{givenCSR, secret},
+				CertManagerObjects: []runtime.Object{issuer},
+			}
+			builder.T = t
+			builder.Init()
+			defer builder.Stop()
+			builder.Start()
+
+			selfsigned := &SelfSigned{
+				certClient: builder.Client.CertificatesV1().CertificateSigningRequests(),
+				recorder:   new(testpkg.FakeRecorder),
+				secretsLister: testlisters.FakeSecretListerFrom(testlisters.NewFakeSecretLister(),
+					testlisters.SetFakeSecretNamespaceListerGet(secret, nil),
+				),
+				signingFn: pki.SignCertificate,
+			}
+
+			gotErr := selfsigned.Sign(t.Context(), givenCSR, issuer)
+			require.NoError(t, gotErr)
+			builder.Sync()
+
+			csr, err := builder.Client.CertificatesV1().CertificateSigningRequests().Get(t.Context(), givenCSR.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+
+			if test.wantFailedReason != "" {
+				assert.Empty(t, csr.Status.Certificate)
+				require.Len(t, csr.Status.Conditions, 1)
+				assert.Equal(t, certificatesv1.CertificateFailed, csr.Status.Conditions[0].Type)
+				assert.Equal(t, test.wantFailedReason, csr.Status.Conditions[0].Reason)
+				assert.Equal(t, test.wantFailedMessage, csr.Status.Conditions[0].Message)
+				return
+			}
+
+			require.NotEmpty(t, csr.Status.Certificate)
+			gotCert, err := pki.DecodeX509CertificateBytes(csr.Status.Certificate)
+			require.NoError(t, err)
+			assert.Equal(t, x509.MLDSA65, gotCert.SignatureAlgorithm)
+			assert.Equal(t, x509.KeyUsageDigitalSignature, gotCert.KeyUsage)
 		})
 	}
 }

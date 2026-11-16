@@ -63,7 +63,7 @@ func generateCSR(t *testing.T, secretKey crypto.Signer) []byte {
 
 func generateSelfSignedCert(t *testing.T, cr *cmapi.CertificateRequest, key crypto.Signer, notBefore, notAfter time.Time) []byte {
 	t.Helper()
-	template, err := pki.GenerateTemplateFromCertificateRequest(cr)
+	template, err := pki.CertificateTemplateFromCertificateRequest(cr)
 	if err != nil {
 		t.Errorf("failed to generate cert template from CSR: %v", err)
 		t.FailNow()
@@ -117,7 +117,7 @@ func TestSync(t *testing.T) {
 	baseCRNotApproved := gen.CertificateRequest("test-cr",
 		gen.SetCertificateRequestIsCA(false),
 		gen.SetCertificateRequestCSR(csrRSAPEM),
-		gen.SetCertificateRequestIssuer(cmmeta.ObjectReference{
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
 			Kind: baseIssuer.Kind,
 			Name: baseIssuer.Name,
 		}),
@@ -135,7 +135,7 @@ func TestSync(t *testing.T) {
 	baseCRNotApprovedEC := gen.CertificateRequest("test-cr",
 		gen.SetCertificateRequestIsCA(false),
 		gen.SetCertificateRequestCSR(csrECPEM),
-		gen.SetCertificateRequestIssuer(cmmeta.ObjectReference{
+		gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
 			Kind: baseIssuer.Kind,
 			Name: baseIssuer.Name,
 		}),
@@ -160,7 +160,7 @@ func TestSync(t *testing.T) {
 	tests := map[string]testT{
 		"should return nil (no action) if group name if not 'cert-manager.io' or ''": {
 			certificateRequest: gen.CertificateRequestFrom(baseCR,
-				gen.SetCertificateRequestIssuer(cmmeta.ObjectReference{
+				gen.SetCertificateRequestIssuer(cmmeta.IssuerReference{
 					Group: "not-cert-manager.io",
 				}),
 			),
@@ -372,6 +372,21 @@ func TestSync(t *testing.T) {
 				ExpectedActions: []testpkg.Action{},
 			},
 		},
+		"should return nil (no action) if certificate request invalidrequest is set to true": {
+			certificateRequest: gen.CertificateRequestFrom(baseCRNotApproved,
+				gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+					Type:               cmapi.CertificateRequestConditionInvalidRequest,
+					Status:             cmmeta.ConditionTrue,
+					Reason:             "InvalidRequest",
+					Message:            "Certificate request is invalid",
+					LastTransitionTime: &nowMetaTime,
+				}),
+			),
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{baseIssuer, baseCR},
+				ExpectedActions:    []testpkg.Action{},
+			},
+		},
 		"should return nil (no action) if certificate request is ready and reason Issued": {
 			certificateRequest: gen.CertificateRequestFrom(baseCR,
 				gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
@@ -429,10 +444,10 @@ func TestSync(t *testing.T) {
 				},
 			},
 		},
-		"should return error to try again if there was a error getting issuer wasn't a not found error": {
+		"should return error to try again if there was an error getting issuer wasn't a not found error": {
 			certificateRequest: baseCR.DeepCopy(),
 			helper: &issuerfake.Helper{
-				GetGenericIssuerFunc: func(cmmeta.ObjectReference, string) (cmapi.GenericIssuer, error) {
+				GetGenericIssuerFunc: func(cmmeta.IssuerReference, string) (cmapi.GenericIssuer, error) {
 					return nil, errors.New("this is a network error")
 				},
 			},
@@ -569,7 +584,7 @@ func TestSync(t *testing.T) {
 						gen.SetCertificateRequestCertificate([]byte("a bad certificate")),
 					)},
 				ExpectedEvents: []string{
-					"Warning DecodeError Failed to decode returned certificate: error decoding certificate PEM block",
+					"Warning DecodeError Failed to decode returned certificate: error decoding certificate PEM block: no valid certificates found",
 				},
 				ExpectedActions: []testpkg.Action{
 					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
@@ -582,7 +597,7 @@ func TestSync(t *testing.T) {
 								Type:               cmapi.CertificateRequestConditionReady,
 								Status:             cmmeta.ConditionFalse,
 								Reason:             "Failed",
-								Message:            "Failed to decode returned certificate: error decoding certificate PEM block",
+								Message:            "Failed to decode returned certificate: error decoding certificate PEM block: no valid certificates found",
 								LastTransitionTime: &nowMetaTime,
 							}),
 							gen.SetCertificateRequestFailureTime(nowMetaTime),
@@ -757,7 +772,9 @@ func runTest(t *testing.T, test testT) {
 	}
 
 	c := New(util.IssuerSelfSigned, func(*controller.Context) Issuer { return test.issuerImpl })
-	c.Register(test.builder.Context)
+	if _, _, err := c.Register(test.builder.Context); err != nil {
+		t.Fatal(err)
+	}
 
 	if test.helper != nil {
 		c.helper = test.helper
@@ -765,7 +782,7 @@ func runTest(t *testing.T, test testT) {
 
 	test.builder.Start()
 
-	err := c.Sync(context.Background(), test.certificateRequest)
+	err := c.Sync(t.Context(), test.certificateRequest)
 	if err != nil && !test.expectedErr {
 		t.Errorf("expected to not get an error, but got: %v", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -28,10 +29,56 @@ import (
 	"net"
 	"net/url"
 
+	v1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 )
 
 type CSRModifier func(*x509.CertificateRequest) error
+
+var defaultGenerateCSROptions = []pki.GenerateCSROption{
+	pki.WithEncodeBasicConstraintsInRequest(true),
+	pki.WithNameConstraints(true),
+	pki.WithOtherNames(true),
+	pki.WithUseLiteralSubject(true),
+}
+
+func CSRForCertificate(crt *v1.Certificate, mods ...CSRModifier) (csr []byte, sk crypto.Signer, err error) {
+	cr, err := pki.GenerateCSR(crt, defaultGenerateCSROptions...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	modifiers := []CSRModifier{}
+	modifiers = append(modifiers, func(c *x509.CertificateRequest) error {
+		*c = *cr
+		return nil
+	})
+	modifiers = append(modifiers, mods...)
+
+	return CSR(cr.PublicKeyAlgorithm, modifiers...)
+}
+
+func CSRWithSignerForCertificate(crt *v1.Certificate, sk crypto.Signer, mods ...CSRModifier) (csr []byte, err error) {
+	cr, err := pki.GenerateCSR(crt, defaultGenerateCSROptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	modifiers := []CSRModifier{}
+	modifiers = append(modifiers, func(c *x509.CertificateRequest) error {
+		if c.PublicKeyAlgorithm != cr.PublicKeyAlgorithm {
+			return fmt.Errorf("public key algorithm mismatch: %s != %s", c.PublicKeyAlgorithm, cr.PublicKeyAlgorithm)
+		}
+		if c.SignatureAlgorithm != cr.SignatureAlgorithm {
+			return fmt.Errorf("signature algorithm mismatch: %s != %s", c.SignatureAlgorithm, cr.SignatureAlgorithm)
+		}
+		*c = *cr
+		return nil
+	})
+	modifiers = append(modifiers, mods...)
+
+	return CSRWithSigner(sk, modifiers...)
+}
 
 func CSR(keyAlgorithm x509.PublicKeyAlgorithm, mods ...CSRModifier) (csr []byte, sk crypto.Signer, err error) {
 	switch keyAlgorithm {
@@ -47,6 +94,11 @@ func CSR(keyAlgorithm x509.PublicKeyAlgorithm, mods ...CSRModifier) (csr []byte,
 		}
 	case x509.Ed25519:
 		sk, err = pki.GenerateEd25519PrivateKey()
+		if err != nil {
+			return nil, nil, err
+		}
+	case x509.MLDSA:
+		sk, err = pki.GenerateMLDSAPrivateKey(mldsa.MLDSA44())
 		if err != nil {
 			return nil, nil, err
 		}
@@ -91,12 +143,22 @@ func CSRWithSigner(sk crypto.Signer, mods ...CSRModifier) (csr []byte, err error
 	case ed25519.PublicKey:
 		keyAlgorithm = x509.Ed25519
 		signatureAlgorithm = x509.PureEd25519
+	case *mldsa.PublicKey:
+		keyAlgorithm = x509.MLDSA
+		switch pub.Parameters() {
+		case mldsa.MLDSA44():
+			signatureAlgorithm = x509.MLDSA44
+		case mldsa.MLDSA65():
+			signatureAlgorithm = x509.MLDSA65
+		case mldsa.MLDSA87():
+			signatureAlgorithm = x509.MLDSA87
+		}
 	default:
 		return nil, fmt.Errorf("unrecognised public key type: %T", sk)
 	}
 
 	cr := &x509.CertificateRequest{
-		Version:            3,
+		Version:            0,
 		SignatureAlgorithm: signatureAlgorithm,
 		PublicKeyAlgorithm: keyAlgorithm,
 		PublicKey:          sk.Public(),
@@ -104,7 +166,7 @@ func CSRWithSigner(sk crypto.Signer, mods ...CSRModifier) (csr []byte, err error
 	for _, mod := range mods {
 		err = mod(cr)
 		if err != nil {
-			return
+			return nil, err
 		}
 	}
 
@@ -115,7 +177,7 @@ func CSRWithSigner(sk crypto.Signer, mods ...CSRModifier) (csr []byte, err error
 	csr = pem.EncodeToMemory(&pem.Block{
 		Type: "CERTIFICATE REQUEST", Bytes: csrBytes,
 	})
-	return
+	return csr, nil
 }
 
 func SetCSRDNSNames(dnsNames ...string) CSRModifier {
